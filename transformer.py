@@ -5,20 +5,24 @@ class MultiHeadAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key, value, W_q, W_k, W_v, W_o, num_heads):
         #batch = Number of examples/sequences in the batch.
-        #seq_len: Length of each sequence (e.g., number of tokens).
-        #d_model: Dimensionality of each token’s embedding (the feature size).
+        #seq_len: How many tokens/patches are in each sequence --> If we do 2x2 patching on 28x28 mnist images we get 14*14 = 196 patches per sequence
+        #d_model: Dimensionality of each token’s embedding (the feature size) -> Not necessarily the patch dimensionality usually we project onto higher dimensionality was slightly confused why?
+        #I didn't implement the pre-attention embeding and assume that the input is already in the shape of (batch, seq_len, d_model)
         batch, seq_len, d_model = query.size()
-        #d_k is the dimensionality of each head, as total dimensionality is split to each head
+        #d_k is the dimensionality of each head, as we will project down the total dimensionality to each 
         d_k = d_model // num_heads
         scale = 1.0 / math.sqrt(d_k)
 
         #Create the queries, keys and values matrices by multiplying by the learned weights
+        #Here b = batch, t = seq_len, d = d_model, and h = output dimensionality which in most cases is also d_model
         Q = torch.einsum('btd,dh->bth', query, W_q)
         K = torch.einsum('btd,dh->bth', key, W_k)
         V = torch.einsum('btd,dh->bth', value, W_v)
 
         #Splitting the matrices into seperate heads 
-        #Q/K/V are of shape (batch, seq_len, d_model), using .veiw(batch, seq_len, num_heads, d_k) splits the last dimension (d_model) into num_heads dimensions of size d_k (head dimensions)
+        #Q/K/V are of shape (batch, seq_len, d_model)
+        #.veiw(batch, seq_len, num_heads, d_k) is a command that splits the last dimension (d_model) into num_heads dimensions of size d_k (head dimensions)
+        #For example if we had Q of shape (32, 196, 16), we could split it into 4 heads of size 4 by using .view(32, 196, 4, 4)
         Q = Q.view(batch, seq_len, num_heads, d_k)
         K = K.view(batch, seq_len, num_heads, d_k)
         V = V.view(batch, seq_len, num_heads, d_k)
@@ -33,9 +37,13 @@ class MultiHeadAttention(torch.autograd.Function):
         #We sum over the dimension d, which is the per–head feature dimension.
         #Our output tenser here is of shape (batch, num_heads, seq_len, seq_len)
         #For each query position (q) --> 3rd dimension, we get a score for each key position (k) --> 4th dimension
+        #This produces a scalar value for each combination of a query position q and a key position k, for each head n and for each batch element b
+        #Does so by computing a dot product between the query and key vectors for every single possible query and key position and summing for each
         scores = torch.einsum('bnqd,bnkd->bnqk', Q, K)
 
         #Scale the scores by 1/sqrt(d_k) so they don't explode due to the summation
+        #This is done to prevent the dot product from becoming too large or too small
+        #Now we can thunk of scores as a tensor represents the similarity between a specific query and a key for each batch and head element 
         scores = scores * scale
 
         #Apply softmax to the scores to get the attention weights
@@ -43,7 +51,9 @@ class MultiHeadAttention(torch.autograd.Function):
         attn = torch.nn.functional.softmax(scores, dim=-1)
         
         #For every batch and head, for each query position (q),sum the attention weights over all keys (indexed by k) * corresponding value vectors
-        #One output vector per query for each head.
+        #For every example (batch index b) and every head (n), for each query position (q), you take the corresponding attention weights over all key positions (given by attn[b,n,q,k]) and use them to weight the corresponding value vectors (from V[b,n,k,d]).
+        #The sum over k produces a new vector for each query position, which is a weighted sum of the value vectors.
+        #Aggregates information from every token in the input for each query, resulting in a new representation for each token that takes into account the entire input sequence.
         head_outputs = torch.einsum('bnqk,bnkd->bnqd', attn, V)
 
         #Swap the second and third dimensions to get shape (batch, seq_len, num_heads, d_k)
@@ -51,6 +61,7 @@ class MultiHeadAttention(torch.autograd.Function):
         head_outputs = head_outputs.transpose(1, 2)
 
         #Concatenate the heads together using .view()
+        #Merges the heads (3rd and 4th dimension) together to get a tensor of shape (batch, seq_len, d_model)
         #.contiguous() makes sure the memory is contiguous for efficiency
         concatenated = head_outputs.contiguous().view(batch, seq_len, d_model)
 
@@ -66,6 +77,7 @@ class MultiHeadAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        #Retrieve saved tensors and parameters using ctx
         query, key, value, Q, K, V, attn, concat, W_q, W_k, W_v, W_o = ctx.saved_tensors
         num_heads = ctx.num_heads
         scale = ctx.scale
@@ -73,35 +85,59 @@ class MultiHeadAttention(torch.autograd.Function):
         d_k = d_model // num_heads
 
         # output = concatenated * W_o  (via einsum: 'btd,dh->bth')
-        #So grad_concat =  
+        #So grad_concat =  grad_output * W_o.t() by chain rule
+        #grad_output is of shape (batch, seq_len, d_model)
+        #W_o is of shape (output_dim, d_model) -> (h, d) -> which in our case is (d_model, d_model)
+        #So we get desired shape (batch, seq_len, d_model) for grad_concat which matches our concatenation
         grad_concat = torch.einsum('bth,hd->btd', grad_output, W_o.t())
+
+        # Compute grad_W_o: For the forward operation, output = concatenated * W_o (via 'btd,dh->bth').
+        # By the chain rule, grad_W_o = concat.T() * grad_output, summing over batch (b) and token (t) dimensions.
+        #Here, concat has shape (batch, seq_len, d_model) and grad_output has shape (batch, seq_len, d_model).
+        #The einsum 'btd,bth->dh' implicitly sums over both b and t given our directions, producing a tensor of shape (d_model, d_model) for grad_W_o, so we don't need to transpose concat
         grad_W_o = torch.einsum('btd,bth->dh', concat, grad_output)
 
-        ### Step B: Reshape grad_concat to get grad for head outputs ###
-        # The concatenated tensor was formed by reshaping head_out (shape: (batch, num_heads, seq_len, d_k))
+        #Similar to the forward pass, we need to reshape grad_concat to get a gradient for each head output
+        #We do this by reshaping grad_concat to (batch, seq_len, num_heads, d_k)
+        #Then we swap the second and third dimensions to get shape (batch, num_heads, seq_len, d_k) to match our head_outputs
         grad_head_output = grad_concat.view(batch, seq_len, num_heads, d_k)
         grad_head_output = grad_head_output.transpose(1, 2)
 
-        # Now grad_head_out has shape (batch, num_heads, seq_len, d_k)
-
-        ### Step C: Gradients through the weighted sum: head_out = attn * V ###
-        # For each element: H_{bnqd} = sum_{k} A_{bnqk} * V_{bnkd}
+        #The einsum string 'bnqk,bnqd->bnkd' instructs PyTorch to:
+        #For each batch and head, for each query position (q), sum the attention weights over all keys (indexed by k) * corresponding value vectors
+        #In forward pass each value vector contributes to the output at every query position so the gradient for each value is the sum over all query positions of the attention weight times the gradient from the head outpu
         grad_attn = torch.einsum('bnqd,bnkd->bnqk', grad_head_output, V)
+        
+        #Here, the attention weights determine how much each value contributes to the head output.
+        #This computes the gradient for each value vector V by weighting the gradient from the head outputs by the attention weights.
+        #Similar to above
         grad_V = torch.einsum('bnqk,bnqd->bnkd', attn, grad_head_output)
 
-        ### Step D: Backprop through the softmax ###
-        # For softmax, the derivative is:
-        # dL/ds = A * (grad_attn - sum(grad_attn * A, axis=-1, keepdim=True))
+        # Compute the aggregated gradient over keys for each query:
+        # For softmax, the derivative is A * (grad_attn - sum(grad_attn * A)).
+        # We sum (grad_attn * attn) over the key dimension to get sum_grad.
         sum_grad = torch.sum(grad_attn * attn, dim=-1, keepdim=True)
-        grad_scores  = attn * (grad_attn - sum_grad)
-        # Account for the scaling in the forward pass:
+
+        # Subtract sum_grad from grad_attn and multiply elementwise by attn to obtain grad_scores,
+        # which gives the gradient of the loss with respect to the raw scores.
+        grad_scores = attn * (grad_attn - sum_grad)
+
+        # Finally, multiply by the scale factor (used in forward) to complete the gradient computation.
         grad_scores = grad_scores * scale
 
-        ### Step E: Backprop through the dot product: scores = einsum('bnqd,bnkd->bnqk', Q, K) * scale ###
+        # grad_Q: For each query Q[b,n,q,d], the dot product with K[b,n,k,d] affects scores for all keys k.
+        # Thus, grad_Q[b,n,q,d] = sum_k (grad_scores[b,n,q,k] * K[b,n,k,d]).
+        # The einsum 'bnqk,bnkd->bnqd' multiplies grad_scores and K elementwise over d and sums over k.
         grad_Q = torch.einsum('bnqk,bnkd->bnqd', grad_scores, K)
+
+        # grad_K: For each key K[b,n,k,d], its contribution spans all queries q.
+        # Hence, grad_K[b,n,k,d] = sum_q (grad_scores[b,n,q,k] * Q[b,n,q,d]).
+        # The einsum 'bnqk,bnqd->bnkd' multiplies grad_scores and Q elementwise over d and sums over q.
         grad_K = torch.einsum('bnqk,bnqd->bnkd', grad_scores, Q)
 
-        ### Step F: Reshape grad_Q, grad_K, grad_V back to (batch, seq_len, d_model) ###
+        #We need to get the gradients for Q, K and V back to the shape (batch, seq_len, d_model)
+        #We will do the reverse of what we did in forward pass, swaping the second and third dimensions to get shape (batch, num_heads, seq_len, d_k)
+        #Then we concatenate the heads together to get shape (batch, seq_len, d_model)
         grad_Q_reshaped = grad_Q.transpose(1, 2)
         grad_Q_reshaped = grad_Q_reshaped.contiguous().view(batch, seq_len, d_model)
 
@@ -111,17 +147,21 @@ class MultiHeadAttention(torch.autograd.Function):
         grad_V_reshaped = grad_V.transpose(1, 2)
         grad_V_reshaped = grad_V_reshaped.contiguous().view(batch, seq_len, d_model)
 
-        ### Step G: Gradients for the initial linear projections ###
+        #For each of these linear operations, the gradient with respect to the input is given by 
+        #multiplying the gradient of the projection (e.g. grad_Q_reshaped) by the transpose of the corresponding weight matrix.
+        #This is by the chain rule
         grad_query = torch.einsum('btd,dh->bth', grad_Q_reshaped, W_q.t())
         grad_key   = torch.einsum('btd,dh->bth', grad_K_reshaped, W_k.t())
         grad_value = torch.einsum('btd,dh->bth', grad_V_reshaped, W_v.t())
 
+        #The gradients with respect to the weight matrices are obtained by the outer product of the original input and the gradient of the output, summed over the batch and token dimensions.
+        #Here, the einsum 'btd,bte->de' basically computes query^T * grad_Q_reshaped (and similarly for key and value), because we are summing over the batch and token dimension
+        #This results in gradients of shape (d_model, d_model) that match the shapes of W_q, W_k, and W_v.
         grad_W_q = torch.einsum('btd,bte->de', query, grad_Q_reshaped)
         grad_W_k = torch.einsum('btd,bte->de', key,   grad_K_reshaped)
         grad_W_v = torch.einsum('btd,bte->de', value, grad_V_reshaped)
 
-        # The backward function returns a gradient for every input to the forward.
-        # For non-tensor inputs (like num_heads), we return None.
+        #Returns a gradient for every input to the forward, for non-tensor inputs (like num_heads), we return None.
         return grad_query, grad_key, grad_value, grad_W_q, grad_W_k, grad_W_v, grad_W_o, None
 
 
