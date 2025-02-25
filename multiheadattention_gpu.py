@@ -171,13 +171,13 @@ def custom_mha(query, key, value, W_q, W_k, W_v, W_o, num_heads):
     return MultiHeadAttention.apply(query, key, value, W_q, W_k, W_v, W_o, num_heads)
 
 if __name__ == "__main__":
-    # *** CHANGED: Set up the device ***
+    # Set up the device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Running on device:", device)
 
     batch, seq_len, d_model, num_heads = 2, 5, 16, 4
 
-    # *** CHANGED: Create tensors on the GPU ***
+    # Create tensors on the GPU
     standard_mha = torch.nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads).double().to(device)
     query = torch.randn(batch, seq_len, d_model, dtype=torch.double, requires_grad=True, device=device)
     key   = torch.randn(batch, seq_len, d_model, dtype=torch.double, requires_grad=True, device=device)
@@ -188,7 +188,6 @@ if __name__ == "__main__":
     W_v = torch.randn(d_model, d_model, dtype=torch.double, requires_grad=True, device=device)
     W_o = torch.randn(d_model, d_model, dtype=torch.double, requires_grad=True, device=device)
 
-    # *** CHANGED: Ensure standard_mha uses GPU weights ***
     with torch.no_grad():
         standard_mha.in_proj_weight.copy_(
             torch.cat((W_q.t(), W_k.t(), W_v.t()), dim=0))
@@ -207,7 +206,6 @@ if __name__ == "__main__":
 
     print("Maximum absolute difference in forward outputs:", (custom_output - standard_output).abs().max().item())
 
-    # *** CHANGED: Perform gradient check on GPU inputs - Compare backwards pass ***
     inputs = (query, key, value, W_q, W_k, W_v, W_o, num_heads)
     test = torch.autograd.gradcheck(custom_mha, inputs, eps=1e-6, atol=1e-4)
     print("Gradient check passed?", test)
