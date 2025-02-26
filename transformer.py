@@ -142,6 +142,9 @@ class VisionTransformer(nn.Module):
         return logits
     
 if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Running on device:", device)
+
     #Use dummy "MNIST-like" images
     batch_size = 8
     image_size = 28
@@ -154,8 +157,7 @@ if __name__ == "__main__":
     num_layers = 1      # Start with one encoder layer
     dropout = 0.1
 
-    # Create dummy images to test output size
-    dummy_images = torch.randn(batch_size, in_channels, image_size, image_size)
+    dummy_images = torch.randn(batch_size, in_channels, image_size, image_size, device=device)
 
     model = VisionTransformer(
         image_size=image_size,
@@ -167,7 +169,7 @@ if __name__ == "__main__":
         d_linear=d_linear,
         num_layers=num_layers,
         dropout=dropout
-    )
+    ).to(device)
 
     logits = model(dummy_images)
     print("Logits shape:", logits.shape)
